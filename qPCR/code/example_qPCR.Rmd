@@ -1,0 +1,114 @@
+---
+title: "example_qPCR_analysis"
+author: "Libby Murphy"
+date: "`Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Example qPCR analysis
+
+This is an example qRT-PCR analysis using the delta-delta-Cq method. I normalized to a housekeeper gene and a calibrator. All genes and samples have been re-labeled to protect unpublished findings, so please do not consider this document to reflect any real-world biology.
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE)
+library(tidyverse)
+library(here)
+library(purrr)
+library(conflicted)
+conflicts_prefer(dplyr::filter)
+library(ggprism)
+
+experiment <- "qPCR"
+```
+
+## QC comparisons 
+
+```{r qc, echo=FALSE, message=FALSE, warning=FALSE}
+# read in data file 
+data <- read_csv(here::here(experiment, "data", "example_qPCR.csv")) %>% dplyr::select("Well", "Target", "Sample", "Cq")
+
+Cq_QC <- ggplot(data = data, aes(y = Cq, x = Target, color = Sample)) +
+  geom_jitter(width = .2, size = 2) + 
+  theme_prism() + 
+  ylim(0,40) +
+  ggtitle("Cq") +
+  theme(axis.text.x = element_text(angle = 60, hjust=0.5))
+
+Cq_QC
+
+# This looks good. I don't see any NTC wells crossing the threshold and replicates are grouping together.
+
+# I have two housekeeper genes in this experiment: GENE6 and GENE7. I'll check the sd on both and normalize to whichever is tighter. The other will be discarded.
+paste("sd GENE6 = ", (data[!is.na(data$Cq),] %>% dplyr::filter(Target == "GENE6", Sample != "CALIB_NA", Sample != "NTC_NA") %>% pull(Cq) %>% sd()), sep = "")
+paste("sd GENE7 = ", (data[!is.na(data$Cq),] %>% dplyr::filter(Target == "GENE7", Sample != "CALIB_NA", Sample != "NTC_NA") %>% pull(Cq) %>% sd()), sep = "") # winner!
+
+# remove H2ONTC and noRT samples
+data_filt <- data %>% filter(Sample != "NTC_NA")
+
+# remove all rows with a Cq of NaN
+data_filt <- na.omit(data_filt)
+```
+
+QC plot looks nice. GENE7 was the superior HKG. Proceed with normalization
+
+```{r normalization, echo=FALSE, message=FALSE, warning=FALSE}
+# group data into individual conditions and calculate the condition mean. 
+dataSum <- data_filt %>% 
+  group_by(Target, Sample) %>%
+  dplyr::summarise(Cq = mean(Cq)) %>%
+  pivot_wider(names_from = Target, values_from = Cq)
+
+# calculate deltaCq (dCq). Select other targets and subtract HKG from them to get dCq
+data_dCq <- bind_cols(
+  dataSum %>% dplyr::select(Sample),
+  dataSum %>% purrr::keep(is.numeric) - dataSum$GENE7
+  ) %>% 
+  dplyr::select(-"GENE7")
+
+tmp <- data_dCq %>% purrr::keep(is.numeric) %>% t() %>% as.data.frame()
+
+colnames(tmp) <- data_dCq %>% dplyr::select(Sample) %>% as.matrix()
+
+ddCq <- tmp %>%
+  mutate(veh_compoundStim = veh_compoundStim - CALIB_NA) %>%
+  mutate(veh_compoundVeh = veh_compoundVeh - CALIB_NA) %>%
+  mutate(tx_compoundStim = tx_compoundStim - CALIB_NA) %>%
+  mutate(tx_compoundVeh = tx_compoundVeh - CALIB_NA) %>%
+  select(-CALIB_NA)
+
+ddCq_lfc <- 2^-(ddCq)
+
+ddCq_preplot <- data.frame(t(ddCq_lfc)) %>% rownames_to_column(var = "Sample") 
+
+ddCq_plot <- reshape2::melt(ddCq_preplot, value.name = "ddCq", variable.name = "target") %>% separate(col = Sample, into = c("cocktail", "tx"), sep = "_")
+```
+
+```{r plotting, echo = FALSE, message=FALSE, warning=FALSE}
+ddCq_plot$cocktail <- factor(ddCq_plot$cocktail, levels = c("veh", "tx"))
+ddCq_plot$tx <- factor(ddCq_plot$tx, levels = c("compoundVeh", "compoundStim"))
+
+pddCq <- ggplot(ddCq_plot[!c(grepl(pattern = "GENE6", ddCq_plot$target)),]) +
+  geom_col(aes(x = cocktail, y = ddCq, fill = tx), position = position_dodge(), color = "black") +
+  facet_grid(~ target) +
+  theme_prism() + # I use ggprism for visual continuity with lab members who prefer Graphpad Prism.
+  ylab("lfc") +
+  scale_fill_manual(values = c("grey25", "grey75")) +
+  theme(axis.text.x = element_text(angle = 60, hjust=0.5)) +
+  ggtitle("example_qPCR")
+
+pddCq
+```
+
+```{r save plots, echo = FALSE, message=FALSE, warning=FALSE}
+ggsave(filename = "example_qPCR.png", plot = cowplot::plot_grid(Cq_QC, pddCq, nrow = 1), device = "png", height = 5, width = 15, path = here::here(experiment, "results"))
+
+ggsave(filename = "example_qPCR_lfc.png", plot = pddCq, device = "png", height = 5, width = 10, path = here::here(experiment, "results"))
+
+ggsave(filename = "example_qPCR_Cq.png", plot = Cq_QC, device = "png", height = 5, width = 8, path = here::here(experiment, "results"))
+
+write_csv(ddCq_plot, file = here(experiment, "results", "example_qPCR_lfc.csv"))
+```
+
+The treatment induced an increase in all genes with compoundVeh. compoundStim strikingly ameliorated the increase in expression of all genes.

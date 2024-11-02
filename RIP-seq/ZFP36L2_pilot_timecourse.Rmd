@@ -1,0 +1,1011 @@
+---
+title: "ZFP36L2_pilot_timecourse"
+output: html_document
+date: 'sys.Date()'
+author: "Libby Murphy"
+editor_options: 
+  chunk_output_type: console
+---
+
+# setup
+```{r setup}
+# install Bioconductor 3.15:
+#if (!require("BiocManager", quietly = TRUE)) +
+#    install.packages("BiocManager")
+#BiocManager::install(version = "3.15")
+# tools:::.BioC_version_associated_with_R_version() # this reports the version of bioconductor associated with the version of R that you're running
+
+# BiocManager::install("BSgenome.Hsapiens.UCSC.hg38")
+
+library(dplyr)
+library(here)
+library(tidyverse)
+library(viridis)
+library(pheatmap)
+library(ggplot2)
+library(cowplot)
+library(gridExtra)
+library(ggthemes)
+library(ggrepel)
+library(ggpubr)
+library(scales)
+library(reshape2)
+library(tximport)
+library(DESeq2)
+library(pathfindR)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene) 
+library(org.Hs.eg.db)
+library(Hmisc) # cut2
+```
+
+```{r tx import}
+# read in gene information
+geneInfo <- read_csv(here("accessories","gencode.v26.primary.info.witFLAG.csv.zip"), col_names = F) 
+
+# give columns informative names
+colnames(geneInfo) <- c("gene_id","transcript_id","biotype","symbol")
+
+# create a dataframe containing only transcript ID and gene ID
+tx2gene <- geneInfo[,c(2,1)]
+
+
+mysamples <- list.dirs(path = here("data","rnaseq","salmon"), full.names = F, recursive = F)
+
+# Make a new object containing metadata 
+metadata <- readxl::read_xlsx(here("accessories","NMLabLibrarySummary.xlsx"), sheet = 1, skip = 1) %>% filter(SampleID %in% mysamples) %>%
+  dplyr::select(SampleID, Treatment1, Treatment2, Time_hr) %>%
+  as.data.frame()
+
+colnames(metadata) <- c("SampleID", "Dox", "Rep", "AngII")
+
+metadata$Rep <- gsub(
+  pattern = "AngII_", 
+  replacement = "", 
+  x = metadata$Rep
+)
+
+metadata$AngII <- gsub(
+  pattern = "0", 
+  replacement = "0h", 
+  x = metadata$AngII
+)
+
+metadata$AngII <- gsub(
+  pattern = "8", 
+  replacement = "8h", 
+  x = metadata$AngII
+)
+
+metadata$AngII <- gsub(
+  pattern = "24", 
+  replacement = "24h", 
+  x = metadata$AngII
+)
+
+
+# hacky but not worth doing elegantly rn
+myquantfiles <- grep(pattern = "quant.sf", x = list.files(here(), recursive = T), value = T)[1:12]
+  
+
+# give the paths for the quant files names that reflect their IP conditions from the metadata object
+names(myquantfiles) <- paste(metadata$Dox, metadata$Rep, metadata$AngII, sep = "_")
+
+
+myTxi <- tximport(files = myquantfiles, type = "salmon", tx2gene = tx2gene)
+
+
+geneInfo %>% 
+  dplyr::filter(gene_id == "3XFLAG-ZFP36L2")
+
+myTxi$counts %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "gene_id") %>% 
+  dplyr::filter(gene_id == "3XFLAG-ZFP36L2")
+
+```
+
+
+# early visualization qc
+
+```{r pca qc}
+qcinput <- myTxi$abundance %>% 
+  as.data.frame() %>%
+  dplyr::select("minusdox_RepB_0h":"plusdox_RepC_24h") %>%
+  as.matrix()
+
+qcinput <- log2(qcinput[rowSums(qcinput) > 20,] + 1)
+
+pca_data <- prcomp(qcinput, center = T, scale. = T) 
+
+pca_data_info <- summary(pca_data) 
+
+pca_plot_data <- data.frame(pca_data$rotation) 
+
+pca_plot_data$ID <- rownames(pca_plot_data)
+
+pca_plot_data <- pca_plot_data %>% 
+  separate(col = ID, sep = "_", into = c("dox","rep","stim"))
+
+labelPosition <- pca_plot_data %>% 
+  group_by(dox, stim, rep) %>% 
+  dplyr::select(PC1, PC2) %>% 
+  summarise(mPC1=mean(PC1), mPC2=mean(PC2))
+
+myCols <- c("darkgrey",
+            RColorBrewer::brewer.pal(n = 8, name = "Blues")[6],
+            RColorBrewer::brewer.pal(n = 6, name = "Reds")[c(3,6)])
+
+
+
+PCAplot <- ggplot(pca_plot_data, aes(x=PC1, y=PC2, color = dox, shape = stim)) +
+  geom_point(size=3) + 
+  theme_classic() +
+  ggtitle("PCA of pilot timecourse samples") +
+  scale_color_manual(values = myCols) +
+  xlab(paste("PC1 (%",100*round(pca_data_info$importance[2,1], digits = 3),")", sep = "")) +
+  ylab(paste("PC2 (%",100*round(pca_data_info$importance[2,2], digits = 3),")", sep = "")) 
+PCAplot
+
+# ggsave(plot = PCAplot, filename = here("plots", "PCAplot.png"))
+# makes sense
+```
+
+
+# differential expression with DESeq2
+```{r differential expression in +/-dox 0h}
+sampleData <- data.frame(
+  "sample" = colnames(myTxi$counts)
+) %>%
+  separate(col = sample, into = c("Dox", "Rep", "Time"), sep = "_") 
+rownames(sampleData) <- colnames(myTxi$counts)
+  
+sampleData$Dox <- factor(sampleData$Dox, levels = c("minusdox","plusdox"))
+
+sampleData_0h <- sampleData %>%
+  dplyr::filter(Time == "0h")
+
+myTxi_0h <- myTxi$counts %>%
+  as.data.frame() %>%
+  dplyr::select(contains("_0h")) %>%
+  round()
+
+
+
+dds_Dox <- DESeqDataSetFromMatrix( # I'm not using from matrix because no pre-processing was necessary between tximport and DESeq.
+                              countData = myTxi_0h,
+                              colData = sampleData_0h,
+                              design = ~ Dox
+                              )
+
+dds_Dox$Dox <- factor(dds_Dox$Dox, levels = c("minusdox","plusdox"))
+
+
+keep <- rowSums(counts(dds_Dox)) >= 10 # filter
+dds_Dox <- dds_Dox[keep,]
+
+dds_Dox <- DESeq(dds_Dox)
+
+
+# extract results from deseq object include symbol and biotype
+res_dox <- results(dds_Dox, contrast = c("Dox", "plusdox", "minusdox"))
+# res_dox$symbol <- mcols(dds_Dox)$symbol
+# res_dox$biotype <- mcols(dds_Dox)$biotype
+res_dox <- res_dox %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "gene_id") %>%
+  dplyr::right_join(
+    dplyr::filter(geneInfo, gene_id %in% rownames(res_dox)) %>% 
+    dplyr::select(!transcript_id) %>% 
+    unique(), 
+  by = "gene_id")
+
+res_dox_0h <- res_dox
+
+dplyr::filter(res_dox, symbol == "ZFP36L2")
+dplyr::filter(res_dox, symbol == "LDLR")
+dplyr::filter(res_dox, symbol == "CYP17A1")
+
+res_dox_filt_0h <- res_dox %>%
+  as.data.frame() %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(symbol, log2FoldChange, padj, stat, biotype) 
+
+write_csv(res_dox_filt_0h, file = here("data", "0h_diff_expr.csv"))
+```
+
+```{r differential expression in +/-dox 8h}
+sampleData_8h <- sampleData %>%
+  dplyr::filter(Time == "8h")
+
+myTxi_8h <- myTxi$counts %>%
+  as.data.frame() %>%
+  dplyr::select(contains("_8h")) %>%
+  round()
+
+
+
+dds_Dox_8h <- DESeqDataSetFromMatrix( # I'm not using from matrix because no pre-processing was necessary between tximport and DESeq.
+                              countData = myTxi_8h,
+                              colData = sampleData_8h,
+                              design = ~ Dox
+                              )
+
+dds_Dox_8h$Dox <- factor(dds_Dox_8h$Dox, levels = c("minusdox","plusdox"))
+
+
+keep <- rowSums(counts(dds_Dox_8h)) >= 10 # filter
+dds_Dox_8h <- dds_Dox_8h[keep,]
+
+dds_Dox_8h <- DESeq(dds_Dox_8h)
+
+
+# extract results from deseq object include symbol and biotype
+res_dox_8h <- results(dds_Dox_8h, contrast = c("Dox", "plusdox", "minusdox"))
+
+res_dox_8h <- res_dox_8h %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "gene_id") %>%
+  dplyr::right_join(
+    dplyr::filter(geneInfo, gene_id %in% rownames(res_dox_8h)) %>% 
+    dplyr::select(!transcript_id) %>% 
+    unique(), 
+  by = "gene_id")
+
+dplyr::filter(res_dox_8h, symbol == "ZFP36L2")
+dplyr::filter(res_dox_8h, symbol == "LDLR")
+dplyr::filter(res_dox_8h, symbol == "CYP17A1")
+
+res_dox_filt_8h <- res_dox_8h %>%
+  as.data.frame() %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(symbol, log2FoldChange, padj, stat, biotype) 
+
+write_csv(res_dox_filt_8h, file = here("data", "8h_diff_expr.csv"))
+```
+
+```{r differential expression in +/-dox 24h}
+sampleData_24h <- sampleData %>%
+  dplyr::filter(Time == "24h")
+
+myTxi_24h <- myTxi$counts %>%
+  as.data.frame() %>%
+  dplyr::select(contains("_24h")) %>%
+  round()
+
+
+
+dds_Dox_24h <- DESeqDataSetFromMatrix( # I'm not using from matrix because no pre-processing was necessary between tximport and DESeq.
+                              countData = myTxi_24h,
+                              colData = sampleData_24h,
+                              design = ~ Dox
+                              )
+
+dds_Dox_24h$Dox <- factor(dds_Dox_24h$Dox, levels = c("minusdox","plusdox"))
+
+
+keep <- rowSums(counts(dds_Dox_24h)) >= 10 # filter
+dds_Dox_24h <- dds_Dox_24h[keep,]
+
+dds_Dox_24h <- DESeq(dds_Dox_24h)
+
+
+# extract results from deseq object include symbol and biotype
+res_dox_24h <- results(dds_Dox_24h, contrast = c("Dox", "plusdox", "minusdox"))
+
+res_dox_24h <- res_dox_24h %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "gene_id") %>%
+  dplyr::right_join(
+    dplyr::filter(geneInfo, gene_id %in% rownames(res_dox_24h)) %>% 
+    dplyr::select(!transcript_id) %>% 
+    unique(), 
+  by = "gene_id")
+
+dplyr::filter(res_dox_24h, symbol == "ZFP36L2")
+dplyr::filter(res_dox_24h, symbol == "LDLR")
+dplyr::filter(res_dox_24h, symbol == "CYP17A1")
+dplyr::filter(res_dox_24h, symbol == "GAPDH")
+
+
+res_dox_filt_24h <- res_dox_24h %>%
+  as.data.frame() %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(symbol, log2FoldChange, padj, stat, biotype) 
+
+write_csv(res_dox_filt_24h, file = here("data", "24h_diff_expr.csv"))
+```
+
+```{r stats}
+######## 0h stats
+stats_0h <- data.frame(
+  "x" = c("lfc", "stat"),
+  "SD" = c(res_dox_0h$log2FoldChange %>% sd(), res_dox_0h$stat %>% sd()),
+  "mean" = c(res_dox_0h$log2FoldChange %>% mean(), res_dox_0h$stat %>% mean()),
+  "median" = c(res_dox_0h$log2FoldChange %>% median(), res_dox_0h$stat %>% median())
+)
+
+stats_0h
+
+stats_0h_filt <- data.frame(
+  "x" = c("lfc", "stat"),
+  "SD" = c(res_dox_filt_0h$log2FoldChange %>% sd(), res_dox_filt_0h$stat %>% sd()),
+  "mean" = c(res_dox_filt_0h$log2FoldChange %>% mean(), res_dox_filt_0h$stat %>% mean()),
+  "median" = c(res_dox_filt_0h$log2FoldChange %>% median(), res_dox_filt_0h$stat %>% median())
+)
+
+stats_0h_filt
+
+######## 8h stats
+stats_8h <- data.frame(
+  "x" = c("lfc", "stat"),
+  "SD" = c(res_dox_8h$log2FoldChange %>% sd(), res_dox_8h$stat %>% sd()),
+  "mean" = c(res_dox_8h$log2FoldChange %>% mean(), res_dox_8h$stat %>% mean()),
+  "median" = c(res_dox_8h$log2FoldChange %>% median(), res_dox_8h$stat %>% median())
+)
+
+stats_8h
+
+######## 24h stats
+stats_24h <- data.frame(
+  "x" = c("lfc", "stat"),
+  "SD" = c(res_dox_24h$log2FoldChange %>% sd(), res_dox_24h$stat %>% sd()),
+  "mean" = c(res_dox_24h$log2FoldChange %>% mean(), res_dox_24h$stat %>% mean()),
+  "median" = c(res_dox_24h$log2FoldChange %>% median(), res_dox_24h$stat %>% median())
+)
+
+stats_24h
+```
+
+```{r sanity check}
+rbind(
+    res_dox_0h %>% dplyr::filter(gene_id == "3XFLAG-ZFP36L2"),
+    res_dox_8h %>% dplyr::filter(gene_id == "3XFLAG-ZFP36L2"),
+    res_dox_24h %>% dplyr::filter(gene_id == "3XFLAG-ZFP36L2")
+)
+# positive LFC in +dox compared to -dox for all three timepoints... interesting
+
+myTxi$counts %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "gene_id") %>%
+  dplyr::filter(gene_id == "3XFLAG-ZFP36L2")%>%
+  t() 
+myTxi$abundance %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "gene_id") %>%
+  dplyr::filter(gene_id == "3XFLAG-ZFP36L2") %>%
+  t() 
+# very low abundance
+
+
+
+
+
+
+############# plots
+
+gene <- geneInfo %>%
+  dplyr::filter(symbol == "3XFLAG-ZFP36L2") %>%
+  pull("gene_id") %>%
+  unique()
+
+sanityPlot <- data.frame(
+  myTxi$abundance %>%
+  as.data.frame() %>%
+  dplyr::select(contains("plusdox")) %>%
+  rownames_to_column(var = "gene_id") %>%
+  dplyr::filter(gene_id == gene) %>%
+  dplyr::select(!"gene_id") %>%
+  as.list(),
+  myTxi$abundance %>%
+  as.data.frame() %>%
+  dplyr::select(contains("minusdox")) %>%
+  rownames_to_column(var = "gene_id") %>%
+  dplyr::filter(gene_id == gene) %>%
+  dplyr::select(!"gene_id") %>%
+  as.list()
+) %>% 
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "temp")
+
+sanityPlot <- separate(sanityPlot, temp, into = c("Dox", "Rep", "Time"), sep = "_")
+colnames(sanityPlot)[4] <- "TPM"
+sanityPlot$Time <- factor(
+  sanityPlot$Time, 
+  levels(
+    factor(
+      sanityPlot$Time
+      )
+    )[c(1,3,2)]
+)
+
+pSanityPlot_3XFLAGZFP36L2 <- ggplot(
+  sanityPlot,
+  aes(x = Time, y = TPM, color = Dox),
+) +
+  geom_jitter(width = 0.25, size = 2.5) +
+  ggtitle("TPMs: 3XFLAG-ZFP36L2") +
+  theme_classic()
+
+ggsave(
+  filename = here("plots", "sanityPlot_FLAGL2.png"),
+  plot = pSanityPlot_3XFLAGZFP36L2,
+  width = 5,
+  height = 3
+)
+```
+
+``` {r mad cowplot disease quarantine zone: Suk et al target plots}
+# decreasers:
+pSanityPlot_CCNA1
+pSanityPlot_CCND1
+pSanityPlot_CCNB1
+pSanityPlot_CDKN1A
+
+# increasers:
+pSanityPlot_TP53
+
+# samers:
+pSanityPlot_CDK2
+pSanityPlot_CDK4
+
+decreasers <- 
+cowplot::plot_grid(
+  pSanityPlot_CCNA1,
+pSanityPlot_CCND1,
+pSanityPlot_CCNB1,
+pSanityPlot_CDKN1A,
+nrow = 1
+)
+
+increasers <- cowplot::plot_grid(
+  pSanityPlot_TP53, NULL, NULL, NULL,
+  nrow = 1
+) 
+
+samers <- 
+  cowplot::plot_grid(
+    pSanityPlot_CDK2,
+pSanityPlot_CDK4,
+NULL, NULL,
+nrow = 1
+  )
+
+suketal_targets <- cowplot::plot_grid(
+  decreasers,
+  increasers,
+  samers,
+  nrow = 3
+)
+
+ggsave(
+  filename = here("plots", "suketal_targets.png"),
+  plot = suketal_targets,
+  width = 15,
+  height = 12
+)
+```
+
+
+# compare lfcs to RIP and CLIP targets
+This should include all genes that are expressed, not constrained to significant expression.  
+Include bins by number of sites, using dox fold change instead of RIP-seq enrichment  
+upregulated in dox , downregulated in dox -> likelihood that they overlap  
+also try x axis is stat instead of lfc  
+can do motif analysis later if wanted  
+```{r import RIP targets}
+# RIP targets come from dyna FLAG-L2 RIP-seq
+RIP_lfc <- read_csv(here("accessories", "RIPTargets.csv"))
+RIP_lfc <- RIP_lfc %>%
+  dplyr::filter(log2FoldChange_dyna >= 0)
+```
+
+``` {r import eCLIP targets} 
+### read in eCLIP data and get it formatted for use.
+eCLIP <- read_tsv(here("accessories", "published_targets", "L2_eclip.bed.gz"))
+row1 <- colnames(eCLIP)
+eCLIP <- rbind(eCLIP, row1)
+colnames(eCLIP) <- c("chrom", "chromStart", "chromEnd", "symbol", "score?", "strand")
+eCLIP <- eCLIP %>% separate(col = symbol, sep = "_", into = c("symbol", "cell","rep"))
+eCLIP$id <- paste(eCLIP$chrom, eCLIP$chromStart, sep = "_")
+### generate a list of high-confidence eCLIP targets. To do this, I'll start by making a list of only eCLIP targets found in all four samples in the eCLIP dataset. If that list is ~200 genes or more then it's good to go. Otherwise, I'll make a list of genes that show up in at least three samples, or genes that show up in both replicates of a cell line or in both cell lines.
+
+# make high confidence dataset A: genes must be present in every rep to be included
+eCLIP_MOLM2_A <- eCLIP %>%
+  filter(cell == "MOLM2") %>%
+  filter(rep == "A") %>%
+  as.data.frame()
+eCLIP_MOLM2_B <- eCLIP %>%
+  filter(cell == "MOLM2") %>%
+  filter(rep == "B") %>%
+  as.data.frame()
+eCLIP_THP_A <- eCLIP %>%
+  filter(cell == "THP") %>%
+  filter(rep == "A") %>%
+  as.data.frame()
+eCLIP_THP_B <- eCLIP %>%
+  filter(cell == "THP") %>%
+  filter(rep == "B") %>%
+  as.data.frame()
+
+# these objects' "common" column states whether the gene shows up in both reps
+eCLIP_MOLM2_A$common <- eCLIP_MOLM2_A$symbol %in% 
+  eCLIP_MOLM2_B$symbol %>%
+  as.data.frame()
+eCLIP_MOLM2_A <- eCLIP_MOLM2_A %>% dplyr::filter(common == TRUE)
+
+eCLIP_THP_A$common <- eCLIP_THP_A$symbol %in% 
+  eCLIP_THP_B$symbol %>%
+  as.data.frame()
+eCLIP_THP_A <- eCLIP_THP_A %>% 
+  dplyr::filter(common == TRUE)
+
+# finalCommon states whether the genes that show up in both reps also show up in both cell types
+eCLIP_MOLM2_A$finalCommon <- eCLIP_MOLM2_A$symbol %in%
+  eCLIP_THP_A$symbol %>%
+  as.data.frame()
+
+HCA <- eCLIP_MOLM2_A %>%
+  dplyr::filter(finalCommon == TRUE) %>%
+  dplyr::select(c("symbol")) %>%
+  distinct()
+```
+
+```{r CDF plot data prep}
+sitesCount <- eCLIP_MOLM2_A %>%
+  dplyr::select("symbol") %>%
+  group_by(symbol) %>%
+  tally(name = "sitesCount")
+
+colnames(res_dox_8h
+         )
+
+sitesCount$bins <-  cut2(
+    x = sitesCount$sitesCount,
+    g = 3
+  ) %>%
+  as.character()
+
+  ######################### 0h #########################
+CDF_data_0h <- res_dox_0h 
+CDF_data_0h <- unique(CDF_data_0h)
+  
+sig_0h <- CDF_data_0h %>% 
+#  dplyr::filter(padj <= 0.05) %>% 
+  dplyr::select("symbol")
+
+targets_0h <- data.frame(
+  "symbol" = sig_0h,
+  "eCLIP" = sig_0h$symbol %in% HCA$symbol,
+  "RIP" = sig_0h$symbol %in% RIP_lfc$symbol
+  )
+    
+CDF_data_0h <- CDF_data_0h %>%
+    left_join(
+      targets_0h,
+      by = "symbol"
+    )
+
+CDF_data_0h <- left_join(
+  CDF_data_0h,
+  sitesCount,
+  by = "symbol"
+)
+    
+  CDF_data_0h$eCLIP <- gsub(pattern = "TRUE", replacement = "Target", x = CDF_data_0h$eCLIP)
+  CDF_data_0h$eCLIP <- gsub(pattern = "FALSE", replacement = "Non-target", x = CDF_data_0h$eCLIP)
+  CDF_data_0h$eCLIP[is.na(CDF_data_0h$eCLIP)] <- "Non-target"
+  CDF_data_0h$sitesCount[is.na(CDF_data_0h$sitesCount)] <- 0
+  CDF_data_0h$bins[is.na(CDF_data_0h$bins)] <- 0
+  CDF_data_0h$RIP <- gsub(pattern = "TRUE", replacement = "Target", x = CDF_data_0h$RIP)
+  CDF_data_0h$RIP <- gsub(pattern = "FALSE", replacement = "Non-target", x = CDF_data_0h$RIP)
+  CDF_data_0h$RIP[is.na(CDF_data_0h$RIP)] <- "Non-target"
+  
+unique(CDF_data_0h$bins)
+CDF_data_0h$bins <- 
+  factor(CDF_data_0h$bins, c("0", "1", "[2, 4)", "[4,52]"))
+colnames(CDF_data_0h)[ncol(CDF_data_0h)] <- "eCLIP_sites"
+  
+  ######################### 8h #########################
+CDF_data_8h <- res_dox_8h
+CDF_data_8h<- unique(CDF_data_8h)
+  
+sig_8h <- CDF_data_8h %>% 
+#  dplyr::filter(padj <= 0.05) %>% 
+  dplyr::select("symbol")
+
+targets_8h <- data.frame(
+  "symbol" = sig_8h,
+  "eCLIP" = sig_8h$symbol %in% HCA$symbol,
+  "RIP" = sig_8h$symbol %in% RIP_lfc$symbol
+  )
+    
+CDF_data_8h <-  CDF_data_8h %>%
+    left_join(
+      targets_8h,
+      by = "symbol"
+    )
+
+CDF_data_8h <- left_join(
+  CDF_data_8h,
+  sitesCount,
+  by = "symbol"
+)
+    
+  CDF_data_8h$eCLIP <- gsub(pattern = "TRUE", replacement = "Target", x = CDF_data_8h$eCLIP)
+  CDF_data_8h$eCLIP <- gsub(pattern = "FALSE", replacement = "Non-target", x = CDF_data_8h$eCLIP)
+  CDF_data_8h$eCLIP[is.na(CDF_data_8h$eCLIP)] <- "Non-target"
+  CDF_data_8h$sitesCount[is.na(CDF_data_8h$sitesCount)] <- 0
+  CDF_data_8h$bins[is.na(CDF_data_8h$bins)] <- 0
+  CDF_data_8h$RIP <- gsub(pattern = "TRUE", replacement = "Target", x = CDF_data_8h$RIP)
+  CDF_data_8h$RIP <- gsub(pattern = "FALSE", replacement = "Non-target", x = CDF_data_8h$RIP)
+  CDF_data_8h$RIP[is.na(CDF_data_8h$RIP)] <- "Non-target"
+  
+unique(CDF_data_8h$bins)
+CDF_data_8h$bins <- 
+  factor(CDF_data_8h$bins, c("0", "1", "[2, 4)", "[4,52]"))
+
+colnames(CDF_data_8h)[ncol(CDF_data_8h)] <- "eCLIP_sites"
+
+    ######################### 24h #########################
+CDF_data_24h <- res_dox_24h
+CDF_data_24h<- unique(CDF_data_24h)
+  
+sig_24h <- CDF_data_24h %>% 
+#  dplyr::filter(padj <= 0.05) %>% 
+  dplyr::select("symbol")
+
+targets_24h <- data.frame(
+  "symbol" = sig_24h,
+  "eCLIP" = sig_24h$symbol %in% HCA$symbol,
+  "RIP" = sig_24h$symbol %in% RIP_lfc$symbol
+  )
+    
+CDF_data_24h <-  CDF_data_24h %>%
+    left_join(
+      targets_24h,
+      by = "symbol"
+    )
+
+CDF_data_24h <- left_join(
+  CDF_data_24h,
+  sitesCount,
+  by = "symbol"
+)
+    
+  CDF_data_24h$eCLIP <- gsub(pattern = "TRUE", replacement = "Target", x = CDF_data_24h$eCLIP)
+  CDF_data_24h$eCLIP <- gsub(pattern = "FALSE", replacement = "Non-target", x = CDF_data_24h$eCLIP)
+  CDF_data_24h$eCLIP[is.na(CDF_data_24h$eCLIP)] <- "Non-target"
+  CDF_data_24h$sitesCount[is.na(CDF_data_24h$sitesCount)] <- 0
+  CDF_data_24h$bins[is.na(CDF_data_24h$bins)] <- 0
+  CDF_data_24h$RIP <- gsub(pattern = "TRUE", replacement = "Target", x = CDF_data_24h$RIP)
+  CDF_data_24h$RIP <- gsub(pattern = "FALSE", replacement = "Non-target", x = CDF_data_24h$RIP)
+  CDF_data_24h$RIP[is.na(CDF_data_24h$RIP)] <- "Non-target"
+  
+unique(CDF_data_24h$bins)
+CDF_data_24h$bins <- 
+  factor(CDF_data_24h$bins, c("0", "1", "[2, 4)", "[4,52]"))
+
+colnames(CDF_data_24h)[ncol(CDF_data_24h)] <- "eCLIP_sites"
+```
+
+``` {r CDF plots lfc}
+pCDF_0h_RIP <- ggplot(CDF_data_0h, aes(log2FoldChange, color = RIP)) +
+  stat_ecdf(geom = "step") +
+  xlim(-2, 2) +
+  theme_few() +
+  ggtitle("0h +/-dox RIP") + 
+  xlab("Log2 Fold Enrich 0h +dox vs -dox RIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#878787", "chartreuse3"))
+
+pCDF_0h_CLIP <- ggplot(CDF_data_0h, aes(log2FoldChange, color = eCLIP_sites)) +
+  stat_ecdf(geom = "step") +
+  xlim(-2, 2) +
+  theme_few() +
+  ggtitle("0h +/-dox CLIP") + 
+  xlab("Log2 Fold Enrich 0h +dox vs -dox CLIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#8c8c8c", "#ffc425", "#f37735", "#d11141"))
+
+pCDF_8h_RIP <- ggplot(CDF_data_8h, aes(log2FoldChange, color = RIP)) +
+  stat_ecdf(geom = "step") +
+  xlim(-2, 2) +
+  theme_few() +
+  ggtitle("8h +/-dox RIP") + 
+  xlab("Log2 Fold Enrich 8h +dox vs -dox RIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#878787", "chartreuse3"))
+
+pCDF_8h_CLIP <- ggplot(CDF_data_8h, aes(log2FoldChange, color = eCLIP_sites)) +
+  stat_ecdf(geom = "step") +
+  xlim(-2, 2) +
+  theme_few() +
+  ggtitle("8h +/-dox CLIP") + 
+  xlab("Log2 Fold Enrich 8h +dox vs -dox CLIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#8c8c8c", "#ffc425", "#f37735", "#d11141"))
+
+pCDF_24h_RIP <- ggplot(CDF_data_24h, aes(log2FoldChange, color = RIP)) +
+  stat_ecdf(geom = "step") +
+  xlim(-2, 2) +
+  theme_few() +
+  ggtitle("24h +/-dox RIP") + 
+  xlab("Log2 Fold Enrich 24h +dox vs -dox RIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#878787", "chartreuse3"))
+
+pCDF_24h_CLIP <- ggplot(CDF_data_24h, aes(log2FoldChange, color = eCLIP_sites)) +
+  stat_ecdf(geom = "step") +
+  xlim(-2, 2) +
+  theme_few() +
+  ggtitle("24h +/-dox CLIP") + 
+  xlab("Log2 Fold Enrich 24h +dox vs -dox CLIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#8c8c8c", "#ffc425", "#f37735", "#d11141"))
+
+
+CDF_cowplot <- cowplot::plot_grid(pCDF_0h_CLIP, pCDF_8h_CLIP, pCDF_24h_CLIP, pCDF_0h_RIP, pCDF_8h_RIP, pCDF_24h_RIP, nrow = 2)
+ggsave(plot = CDF_cowplot, filename = here("plots", "CDF_cowplot_lfc.png"), height = 8, width = 16)
+```
+
+``` {r CDF plots stat}
+pCDF_0h_RIPstat <- ggplot(CDF_data_0h, aes(stat, color = RIP)) +
+  stat_ecdf(geom = "step") +
+  xlim(-2, 2) +
+  theme_few() +
+  ggtitle("0h +/-dox RIP") + 
+  xlab("Stat 0h +dox vs -dox RIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#878787", "chartreuse3"))
+
+pCDF_0h_CLIPstat <- ggplot(CDF_data_0h, aes(stat, color = eCLIP_sites)) +
+  stat_ecdf(geom = "step") +
+  xlim(-3, 3) +
+  theme_few() +
+  ggtitle("0h +/-dox CLIP") + 
+  xlab("Stat 0h +dox vs -dox CLIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#8c8c8c", "#ffc425", "#f37735", "#d11141"))
+
+pCDF_8h_RIPstat <- ggplot(CDF_data_8h, aes(stat, color = RIP)) +
+  stat_ecdf(geom = "step") +
+  xlim(-2, 2) +
+  theme_few() +
+  ggtitle("8h +/-dox RIP") + 
+  xlab("Stat 8h +dox vs -dox RIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#878787", "chartreuse3"))
+
+pCDF_8h_CLIPstat <- ggplot(CDF_data_8h, aes(stat, color = eCLIP_sites)) +
+  stat_ecdf(geom = "step") +
+  xlim(-3, 3) +
+  theme_few() +
+  ggtitle("8h +/-dox CLIP") + 
+  xlab("Stat 8h +dox vs -dox CLIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#8c8c8c", "#ffc425", "#f37735", "#d11141"))
+
+pCDF_24h_RIPstat <- ggplot(CDF_data_24h, aes(stat, color = RIP)) +
+  stat_ecdf(geom = "step") +
+  xlim(-2, 2) +
+  theme_few() +
+  ggtitle("24h +/-dox RIP") + 
+  xlab("Stat 24h +dox vs -dox RIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#878787", "chartreuse3"))
+
+pCDF_24h_CLIPstat <- ggplot(CDF_data_24h, aes(stat, color = eCLIP_sites)) +
+  stat_ecdf(geom = "step") +
+  xlim(-3, 3) +
+  theme_few() +
+  ggtitle("24h +/-dox CLIP") + 
+  xlab("Stat 24h +dox vs -dox CLIP") + 
+  ylab("Cumulative fraction") +
+  scale_color_manual(values = c("#8c8c8c", "#ffc425", "#f37735", "#d11141"))
+
+
+CDF_cowplotstat <- cowplot::plot_grid(pCDF_0h_CLIPstat, pCDF_8h_CLIPstat, pCDF_24h_CLIPstat, pCDF_0h_RIPstat, pCDF_8h_RIPstat, pCDF_24h_RIPstat, nrow = 2)
+ggsave(plot = CDF_cowplotstat, filename = here("plots", "CDF_cowplot_stat.png"), height = 8, width = 16)
+```
+
+```{r pca 0h CLIP}
+tmp <- CDF_data_0h %>%
+  dplyr::filter(eCLIP == "Target")
+
+qcinput <- myTxi$abundance %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "gene_id") %>%
+  dplyr::filter(
+    gene_id %in% tmp$gene_id
+  ) %>%
+  dplyr::select("minusdox_RepB_0h":"plusdox_RepC_24h") %>%
+  as.matrix()
+  
+pca_data <- prcomp(qcinput, center = T, scale. = T) 
+
+pca_data_info <- summary(pca_data) 
+
+pca_plot_data <- data.frame(pca_data$rotation) 
+
+pca_plot_data$ID <- rownames(pca_plot_data)
+
+pca_plot_data <- pca_plot_data %>% 
+  separate(col = ID, sep = "_", into = c("dox","rep","stim"))
+
+labelPosition <- pca_plot_data %>% 
+  group_by(dox, stim, rep) %>% 
+  dplyr::select(PC1, PC2) %>% 
+  summarise(mPC1=mean(PC1), mPC2=mean(PC2))
+
+myCols <- c("darkgrey",
+            RColorBrewer::brewer.pal(n = 8, name = "Blues")[6],
+            RColorBrewer::brewer.pal(n = 6, name = "Reds")[c(3,6)])
+
+
+
+PCAplot_CLIPonly <- ggplot(pca_plot_data, aes(x=PC1, y=PC2, color = dox, shape = stim)) +
+  geom_point(size=3) + 
+  theme_classic() +
+  ggtitle("PCA of pilot timecourse samples: eCLIP targets only") +
+  scale_color_manual(values = myCols) +
+  xlab(paste("PC1 (%",100*round(pca_data_info$importance[2,1], digits = 3),")", sep = "")) +
+  ylab(paste("PC2 (%",100*round(pca_data_info$importance[2,2], digits = 3),")", sep = "")) 
+PCAplot_CLIPonly
+
+# ggsave(plot = PCAplot_CLIPonly, filename = here("plots", "PCAplot_CLIPonly.png"))
+# makes sense
+```
+
+
+# extras that aren't part of the main analysis
+```{r get most abundant isoform for all significantly expressed genes}
+# expressedGenes is a list of all the genes with at least 10 counts across all samples.
+expressedGenes <- myTxi$counts %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "transcript_id") %>%
+  rowwise() %>%
+  mutate(counts = sum(c_across(minusdox_RepB_0h:plusdox_RepC_24h))) %>%
+  filter(counts > 10) %>% 
+  pull("transcript_id") %>% 
+  as.data.frame(col.names = "transcript_id") 
+  
+ colnames(expressedGenes) <- "transcript_id"
+
+expressedGenes <- dplyr::inner_join(
+  tx2gene,
+  expressedGenes,
+  by = "transcript_id"
+) %>%
+  dplyr::select(gene_id)
+  
+
+# mytranscripts is a list of the most abundant isoform for each gene
+mytranscripts_pre <- myTxi$abundance %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "transcript_id") %>%
+  left_join(tx2gene, by="transcript_id")
+
+mytranscripts_pre <- mytranscripts_pre[, c(1,4,2,3,5:ncol(mytranscripts_pre))] #rearranged bc annoying
+
+mytranscripts <- mytranscripts_pre %>%
+  rowwise() %>%
+  mutate(counts = sum(c_across(minusdox_RepB_0h:plusdox_RepC_24h))) %>%
+  dplyr::select(transcript_id,gene_id,counts) %>%
+  semi_join(expressedGenes, by = "gene_id") %>% # filter gene_id %in% expressedGenes freezes if i use it so i'm using semi_join instead
+  group_by(gene_id) %>% 
+  top_n(1, counts) %>% 
+  pull(gene_id, transcript_id) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "transcript_id")
+
+colnames(mytranscripts)[2] <- "gene_id"
+
+# mytranscripts now contains the top most expressed isoform of each gene that's significantly expressed in the dataset. expressedGenes is redundant with mytranscripts
+
+# next task: create a pared-down version of my abundance and counts dfs that only contain significantly expressed genes
+TPMSig <- myTxi$abundance %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "transcript_id") %>%
+  dplyr::filter(
+    transcript_id %in% mytranscripts$transcript_id
+  ) %>%
+  left_join(tx2gene, by = "transcript_id")
+TPMSig <- TPMSig[,c(ncol(TPMSig),1:(ncol(TPMSig)-1))]
+
+CountsSig <- myTxi$counts %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "transcript_id") %>%
+  dplyr::filter(
+    transcript_id %in% mytranscripts$transcript_id
+  ) %>%
+  left_join(tx2gene, by = "transcript_id")
+CountsSig <- CountsSig[,c(ncol(CountsSig),1:(ncol(CountsSig)-1))]
+```
+
+``` {r get transcript sequences, include = FALSE }
+# make txdb from gencode v26 gtf
+# this file isn't in the folder already because it's massive. Make sure not to push the repo to git with the annotation file still in it.
+# txDb objects store UTRs, coding sequences, and exons for a set of genes.
+txdb <- makeTxDbFromGFF(file = here("accessories","gencode.v26.annotation.gtf.gz"))
+saveDb(txdb, here("accessories","txdb.gencode26.sqlite"))
+
+# loadDb 
+txdb <- loadDb(here("accessories","txdb.gencode26.sqlite"))
+
+file.remove(here("accessories","txdb.gencode26.sqlite"))
+
+
+
+
+# get all utrs from txdb
+utr_3 <- threeUTRsByTranscript(txdb, use.names=TRUE) 
+
+# make an object containing the 3' UTRs of all significantly expressed genes (plus a bunch of metadata)
+expressed_utr_3 <- utr_3[names(utr_3) %in% mytranscripts]
+# pull out some more metadata?
+utr_seqs <- getSeq(Hsapiens, unlist(expressed_utr_3))
+
+  
+# take results of differential expression analysis, include only genes that are enriched in the IP and have an adjusted p-value below 0.05 (see below), make a column of the row names, add transcript IDs to only those genes which have more that 10 reads (in this case that's all of them), pull out transcript ids
+# padj explanation: if one called significant all genes with a p value less than or equal to this gene’s p value threshold, what would be the fraction of false positives (the false discovery rate, FDR) among them? We want 
+dynaL2_transcripts <- res_L2_dyna %>%
+  as.data.frame() %>%
+  filter(log2FoldChange > 0 & padj < .05) %>%
+  rownames_to_column(var = "gene_id") %>%
+  inner_join(., TxGeneMax, by = "gene_id") %>% 
+  pull(transcript_id)
+
+
+dynaL2_utr_3 <- utr_3[names(utr_3) %in% dynaL2_transcripts]
+dynaL2_utr_seqs <- getSeq(Hsapiens, unlist(dynaL2_utr_3))
+
+# the dyna-specific steps will be repeated for sigma and endogenous.
+
+# sigmaL2 utr seqs
+sigmaL2_transcripts <- res_L2_sigma %>%
+  as.data.frame() %>%
+  filter(log2FoldChange > 0 & padj < .05) %>%
+  rownames_to_column(var = "gene_id") %>%
+  inner_join(., TxGeneMax, by = "gene_id") %>% 
+  pull(transcript_id)
+
+sigmaL2_utr_3 <- utr_3[names(utr_3) %in% sigmaL2_transcripts]
+sigmaL2_utr_seqs <- getSeq(Hsapiens, unlist(sigmaL2_utr_3))
+
+# endo L2 utr seqs
+endoL2_transcripts <- res_L2_endo   %>%
+  as.data.frame() %>%
+  filter(log2FoldChange > 0 & padj < .05) %>%
+  rownames_to_column(var = "gene_id") %>%
+  inner_join(., TxGeneMax, by = "gene_id") %>% 
+  pull(transcript_id)
+
+endoL2_utr_3 <- utr_3[names(utr_3) %in% endoL2_transcripts]
+endoL2_utr_seqs <- getSeq(Hsapiens, unlist(endoL2_utr_3))
+
+# After that chunk, I now have lists of the 3' UTRs of all the genes enriched in each IP. This data will be used to calculate enrichment of every possible 3'UTR hexamer in each IP.
+```
+
+```{r +/- dox kegg analysis}
+# theory: kegg analysis should show depletion of the pathways that were enriched in the l2 rip seq kegg analysis (top 15: Ribosome Oxidative phosphorylation Vibrio cholerae infection Protein export Non-alcoholic fatty liver disease DNA replication Proteasome Parkinson disease Chemical carcinogenesis - reactive oxygen species Fatty acid elongation RNA polymerase N-Glycan biosynthesis Basal transcription factors Base excision repair)
+
+keggInfo <- res_dox_filt %>%
+  data.frame() %>%
+  dplyr::filter(padj != "NA") %>%
+  dplyr::select("symbol", "log2FoldChange", "padj")
+
+KEGG_output <- pathfindR::run_pathfindR(
+  input = keggInfo,
+  gene_sets = "KEGG",
+  min_gset_size = 10,
+  max_gset_size = 1000,
+  p_val_threshold = 0.05,
+  visualize_enriched_terms = TRUE
+                         )
+
+# write_csv(KEGG_output, file = here("accessories", "KEGG_output.csv"))
+
+# downregulated: ribosome--two of the ones that were "upregulated" in rip. this implies that lots of l2 makes less expressin of those ribo rnas, and they're ones that stick to l2
+```
