@@ -2,7 +2,7 @@
 
 This repository is a showcase of representative samples of my work in R to share as examples of my R scripting and data analysis skills during the graduate school application process.
 
-Please note that any unpublished data has been obscured to protect our group's unpublished findings. I've done my best to make it clear when this is the case. Any documents with nonsense or generic labels (ie. "HUMAN-1" cells treated with "applejuice" and "orangejuice", plots showing expression of "GENE1", etc) have been edited and do not represent real-world data. For that reason, **please do not consider any data in this repository, regardless of how it is labeled, to be reflective of any real-world biology.** This is just a display case for the code itself!
+Please note that any unpublished data, including raw data and labels, has been obscured and/or edited to protect our group's unpublished findings. I've done my best to make it clear when this is the case. Any documents with nonsense or generic labels (ie. "HUMAN-1" cells treated with "applejuice" and "orangejuice", plots showing expression of "GENE1", etc) have been edited and do not represent real-world data. For that reason, **please do not consider any data in this repository, regardless of how it is labeled, to be reflective of any real-world biology.** This is just a display case for the code itself!
 
 ## Guide to this repository
 
