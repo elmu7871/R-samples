@@ -14,7 +14,7 @@ Please note that any unpublished data, including raw data and labels, has been o
 
 **IMR90_cellcount_to_protein** is a quick tool I made to easily convert a user-input number of IMR-90 cells and lysis buffer volume into an estimation of the total protein mass contained in those cells. This was used in an assay in which the assay's lysis buffer was incompatible with any accessible total protein estimation assay.
 
-**proteinCHKr** is a tool to calculate the percent of an annotated protein's total amino acid content which is either cysteine, histidine, or lysine. I use this as a crude screening tool to support early exploration experiments with 4-hydroxynonenal (4-HNE). 4-HNE forms adducts with C, H, and K, so it's helpful to know if a potential target protein has an unusually high or low content of these amino acids.
+**proteinCHKr** is a tool to calculate the percent of an annotated protein's total amino acid content which is either cysteine, histidine, or lysine. The user can input the gene symbols, ENSGs, or ENSTs of the genes of interest and the proteinCHKr returns the percent C/H/K content and an indication of whether the gene of interest is within two standard deviations of the population mean. I use this as a crude screening tool to support early exploration experiments with 4-hydroxynonenal (4-HNE). 4-HNE forms adducts with C, H, and K, so it's helpful to know if a potential target protein has an unusually high or low content of these amino acids.
 
 **qPCR** is a generic example of code which processes qRT-PCR raw data into plots of Cq and log fold change.
 
