@@ -6,8 +6,6 @@ Please note that any unpublished data, including raw data and labels, has been o
 
 ## Guide to this repository
 
-**dose_response** is a generic example of code used to plot plate-based colorimetric dose response to a treatment normalized to DAPI in cultured cells.
-
 **ELISA** is a generic example of code used to process raw data from a sandwich ELISA assay.
 
 **enzyme_activity_assay** is a generic example of code used to process raw absorbance data over time from a colorimetric enzyme activity assay into a plot. 
