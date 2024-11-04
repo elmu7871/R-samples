@@ -6,7 +6,7 @@ Please note that any unpublished data, including raw data and labels, has been o
 
 ## Guide to this repository
 
-**ELISA** is a generic example of code used to process raw data from a sandwich ELISA assay.
+**ELISA** is a generic example of code used to process raw data from a competitive ELISA assay.
 
 **enzyme_activity_assay** is a generic example of code used to process raw absorbance data over time from a colorimetric enzyme activity assay into a plot. 
 
